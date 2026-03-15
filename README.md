@@ -58,7 +58,15 @@ ollama pull llama3.2
 
 # Run the app
 
-`streamlit run rag_app.py`
+Start Ollama in a shell:
+```
+ollama serve
+```
+
+Run the strealit app in another shell:
+```
+streamlit run rag_app.py
+```
 
 
 
