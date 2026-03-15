@@ -13,6 +13,9 @@ Cheatsheets and commands:
 * https://docs.ollama.com/cli
 * Print GPU details: `nvidia-smi`
 * Library of models: https://ollama.com/library?sort=popular
+* Library of prompts: 
+    * https://smith.langchain.com/hub
+    * https://smith.langchain.com/hub/langchain-ai
 
 # Prepare Environment
 
