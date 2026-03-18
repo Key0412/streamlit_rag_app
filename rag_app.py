@@ -1,6 +1,9 @@
 # filepath: /home/klismam/workspace/agent_study/rag_app.py
 import streamlit as st
 import os
+import hashlib
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage, AIMessage
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_classic.embeddings import SentenceTransformerEmbeddings
@@ -8,191 +11,224 @@ from langchain_community.vectorstores import FAISS
 from langchain_community.llms import Ollama
 from langchain_classic.chains import create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
-from langchain_classic import hub
 import tempfile
+
+VECTOR_STORE_DIR = "faiss_indexes"
+
+
+def get_store_path(file_names: list[str]) -> str:
+    """Generate a unique FAISS store path based on the uploaded file names."""
+    key = "_".join(sorted(file_names))
+    hashed = hashlib.md5(key.encode()).hexdigest()[:10]
+    return os.path.join(VECTOR_STORE_DIR, hashed)
+
 
 def handle_pdf_upload():
     """
-    Handle PDF file upload via Streamlit UI.
-    
-    Displays a file uploader widget that accepts PDF files and saves them
-    to a temporary location for processing.
-    
+    Handle (multiple) PDF file uploads via Streamlit UI.
+
     Returns:
-        str or None: The file path to the uploaded PDF, or None if no file is uploaded.
+        list[str]: List of temp file paths for uploaded PDFs, or empty list if none.
     """
-    uploaded_file = st.file_uploader("Upload a PDF file", type="pdf")
-    
-    if uploaded_file is not None:
-        # Save the uploaded file to a temporary location
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
-            temp_file.write(uploaded_file.getbuffer())
-            temp_file_path = temp_file.name
-        return temp_file_path
-    return None
+    uploaded_files = st.file_uploader(
+        "Upload one or more PDF files", type="pdf", accept_multiple_files=True
+    )
+
+    paths = []
+    if uploaded_files:
+        for uploaded_file in uploaded_files:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
+                temp_file.write(uploaded_file.getbuffer())
+                paths.append((uploaded_file.name, temp_file.name))
+    return paths
+
 
 @st.cache_resource
-def load_documents(file_path, chunk_size=500, chunk_overlap=50):
+def load_documents(file_paths_tuple, chunk_size=500, chunk_overlap=50):
     """
-    Load and split a PDF document into chunks.
-    
-    Loads a PDF file from the documents directory and splits it into smaller
-    chunks for efficient processing by the embedding model.
-    
+    Load and split one or more PDF documents into chunks.
+
     Args:
-        file_path (str): The path to the PDF file to load.
-        chunk_size (int, optional): The size of each text chunk in characters. Defaults to 500.
-        chunk_overlap (int, optional): The overlap between consecutive chunks in characters. Defaults to 50.
-    
+        file_paths_tuple (tuple): Tuple of (original_name, temp_path) pairs (hashable for cache).
+        chunk_size (int): Characters per chunk.
+        chunk_overlap (int): Overlap between chunks.
+
     Returns:
-        list: A list of LangChain Document objects representing the split text chunks.
+        list: LangChain Document objects.
     """
-    # Load the PDF document
-    loader = PyPDFLoader(file_path)
-    documents = loader.load()
-    # Split the document into smaller chunks
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-    splits = text_splitter.split_documents(documents=documents)
-    return splits
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size, chunk_overlap=chunk_overlap
+    )
+    all_splits = []
+    for _, temp_path in file_paths_tuple:
+        loader = PyPDFLoader(temp_path)
+        documents = loader.load()
+        splits = text_splitter.split_documents(documents)
+        all_splits.extend(splits)
+    return all_splits
+
 
 @st.cache_resource
-def create_vector_store(documents, model_name="all-MiniLM-L6-v2"):
+def create_vector_store(documents, store_path, model_name="all-MiniLM-L6-v2"):
     """
-    Create a FAISS vector store from document chunks.
-    
-    Generates embeddings for the provided documents using a SentenceTransformer model
-    and stores them in a FAISS vector database for efficient similarity search.
-    
+    Create (or load from disk) a FAISS vector store for the given documents.
+
     Args:
-        documents (list): A list of LangChain Document objects to embed and store.
-        model_name (str, optional): The name of the SentenceTransformer model to use. Defaults to "all-MiniLM-L6-v2".
-    
+        documents (list): LangChain Document objects.
+        store_path (str): Directory path for persisting this index.
+        model_name (str): SentenceTransformer model name.
+
     Returns:
-        FAISS: A FAISS vector store containing the embedded documents.
+        FAISS: Vector store ready for similarity search.
     """
-    # Using langchain's wrapper for sentence transformers and Storing the embeddings in a vector store
     model = SentenceTransformerEmbeddings(model_name=model_name)
+    if os.path.exists(store_path):
+        return FAISS.load_local(
+            store_path, model, allow_dangerous_deserialization=True
+        )
+    os.makedirs(VECTOR_STORE_DIR, exist_ok=True)
     vector_store = FAISS.from_documents(documents=documents, embedding=model)
+    vector_store.save_local(store_path)
     return vector_store
+
 
 @st.cache_resource
 def setup_rag_chain(_vector_store):
     """
-    Set up a Retrieval-Augmented Generation (RAG) chain.
-    
-    Creates a complete RAG pipeline by combining a retriever from the vector store,
-    an LLM (Ollama), and a prompt template to generate answers based on retrieved documents.
-    Requires Ollama to be running locally with the llama3.2 model downloaded.
-    
-    Args:
-        vector_store (FAISS): A FAISS vector store containing embedded documents.
-    
-    Returns:
-        Chain: A LangChain retrieval chain that can process queries and generate answers.
-    """
-    # Use langchain's wrapper for Ollama
-    # Dont forget to start your local Ollama server and have the model downloaded and running - see README.md for instructions
-    llm = Ollama(model="llama3.2")  # Use your local Ollama model
+    Set up a RAG chain that supports conversation history.
 
-    # Create a retriever with a score threshold
+    Args:
+        _vector_store (FAISS): Vector store with embedded documents.
+
+    Returns:
+        Chain: LangChain retrieval chain.
+    """
+    llm = Ollama(model="llama3.2")  # streaming is controlled via .stream() on the chain
+
     retriever = _vector_store.as_retriever(
-        kwargs={
-            "search_type": "similarity",
-            "search_kwargs": {"k": 10, "score_threshold": 0.5}
-        }
+        search_type="similarity_score_threshold",
+        search_kwargs={"k": 10, "score_threshold": 0.5},
     )
 
-    # Fetch the prompt template for retrieval-based question answering
-    retrieval_qa_chat_prompt = hub.pull("langchain-ai/retrieval-qa-chat")
+    # Prompt supports conversation history via chat_history placeholder
+    prompt = ChatPromptTemplate.from_messages([
+        (
+            "system",
+            "You are a helpful assistant. Answer the user's question based only on the "
+            "context below. If the answer is not in the context, say so.\n\nContext:\n{context}",
+        ),
+        MessagesPlaceholder(variable_name="chat_history"),
+        ("human", "{input}"),
+    ])
 
-    # Combine the llm model and the prompt template into a chain that can process retrieved documents and generate answers 
-    combine_docs_chain = create_stuff_documents_chain(llm, retrieval_qa_chat_prompt)
-
-    # Now, create the full retrieval chain by combining the retriever and the document processing chain
+    combine_docs_chain = create_stuff_documents_chain(llm, prompt)
     retrieval_chain = create_retrieval_chain(retriever, combine_docs_chain)
     return retrieval_chain
 
-@st.cache_resource
-def question_storage(user_question, response):
+
+def build_chat_history() -> list:
+    """Build a LangChain-compatible chat history from session state."""
+    history = []
+    for question, answer in st.session_state.get("interactions", []):
+        history.append(HumanMessage(content=question))
+        history.append(AIMessage(content=answer))
+    return history
+
+
+def stream_response(retrieval_chain, user_question: str) -> str:
     """
-    Store user questions in a cache resource.
-    
-    This function is designed to store the most recent user question in a cache resource,
-    allowing it to be accessed across different runs of the Streamlit app. It can be used
-    to maintain state or history of user interactions.
-    
+    Stream response tokens to the UI and return the full answer string.
+
     Args:
-        user_question (str): The user's question to be stored.
-        response (str): The response to be stored.
+        retrieval_chain: The LangChain retrieval chain.
+        user_question (str): The user's question.
+
+    Returns:
+        str: The complete answer text.
     """
-    if 'interactions' not in st.session_state:
-        st.session_state['interactions'] = []
-    st.session_state['interactions'].append((user_question, response))
+    chat_history = build_chat_history()
+
+    def token_generator():
+        for chunk in retrieval_chain.stream(
+            {"input": user_question, "chat_history": chat_history}
+        ):
+            if "answer" in chunk:
+                yield chunk["answer"]
+
+    answer = st.write_stream(token_generator())
+    return answer
+
 
 def main():
     """
     Main Streamlit application function.
-    
-    Orchestrates the entire RAG application by initializing the UI, allowing users to
-    select a PDF source (default or custom upload), loading and processing the document,
-    and providing an interface for users to ask questions about the PDF content.
+
+    Orchestrates the RAG app: multi-PDF upload, vector store creation,
+    conversational question answering with streaming, and history display.
     """
-    st.title("RAG App with Langchain and Ollama - Running on Llama3.2")
-    st.write("""
-             This is a simple Retrieval-Augmented Generation (RAG) application using Langchain Classic.  
-             Upload a PDF document and ask questions about its content.
-             """)
-    
-    # Option to upload a PDF or use the default file
+    st.title("RAG App with Langchain and Ollama — Llama3.2")
+    st.write(
+        "Upload one or more PDF documents and ask questions about their content. "
+        "The assistant remembers your conversation history."
+    )
+
+    # ── Sidebar ─────────────────────────────────────────────────────────────
     st.sidebar.write("### Cache control")
-    
-    # Clear cache button
+
     if st.sidebar.button("🔄 Clear Cache"):
         st.cache_resource.clear()
         st.success("Cache cleared!")
-    
-    # In the sidebar, after the "Clear Cache" button
+
     if st.sidebar.button("🗑️ Clear Conversation"):
-        if 'interactions' in st.session_state:
-            st.session_state['interactions'] = []
+        st.session_state["interactions"] = []
         st.rerun()
-        
-    pdf_path = handle_pdf_upload()
-    if pdf_path is None:
-        st.warning("Please upload a PDF file to proceed.")
+
+    # ── PDF Upload ───────────────────────────────────────────────────────────
+    uploaded = handle_pdf_upload()  # list of (original_name, temp_path)
+
+    if not uploaded:
+        st.warning("Please upload at least one PDF file to proceed.")
         return
-    
-    # Load and process the document
-    documents = load_documents(pdf_path)
-    vector_store = create_vector_store(documents)
+
+    file_names = [name for name, _ in uploaded]
+    st.sidebar.write("**Loaded PDFs:**")
+    for name in file_names:
+        st.sidebar.write(f"• {name}")
+
+    # ── Index / Chain ────────────────────────────────────────────────────────
+    store_path = get_store_path(file_names)
+    documents = load_documents(tuple(uploaded))
+    vector_store = create_vector_store(documents, store_path)
     retrieval_chain = setup_rag_chain(vector_store)
 
-    # User input for questions
+    # ── Question Form ────────────────────────────────────────────────────────
     with st.form("question_form"):
-        user_question = st.text_input("Ask a question about the document:", )
+        user_question = st.text_input("Ask a question about the document(s):")
         submitted = st.form_submit_button("Ask")
-    
+
     if submitted and user_question:
-        with st.spinner("Generating answer..."):
-            response = retrieval_chain.invoke({"input": user_question})
-            answer = response['answer']
-            st.write(answer)
-        question_storage(user_question, answer)
-    
-    # Display conversation history
+        with st.spinner("Retrieving and generating answer..."):
+            answer = stream_response(retrieval_chain, user_question)
+
+        # Store after streaming so history is available for the next turn
+        if "interactions" not in st.session_state:
+            st.session_state["interactions"] = []
+        st.session_state["interactions"].append((user_question, answer))
+
+    # ── Conversation History ─────────────────────────────────────────────────
     st.divider()
     st.subheader("Conversation History")
-    
-    if 'interactions' in st.session_state and st.session_state['interactions']:
-        for i, (question, answer) in enumerate(st.session_state['interactions'][::-1], 1):
-            if i==1:
-                continue
-            i = len(st.session_state['interactions']) - i + 1
+
+    interactions = st.session_state.get("interactions", [])
+    if interactions:
+        for i, (question, answer) in enumerate(reversed(interactions), 1):
+            turn_number = len(interactions) - i + 1
             with st.container(border=True):
-                st.write(f"**Q{i}:** {question}")
-                st.write(f"**A{i}:** {answer}")
+                st.write(f"**Q{turn_number}:** {question}")
+                st.write(f"**A{turn_number}:** {answer}")
     else:
         st.info("No questions asked yet. Ask a question above to get started!")
+
 
 if __name__ == "__main__":
     main()
