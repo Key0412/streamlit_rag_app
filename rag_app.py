@@ -18,7 +18,10 @@ VECTOR_STORE_DIR = "faiss_indexes"
 
 def get_store_path(content_hashes: list[str]) -> str:
     """Generate a unique FAISS store path based on the uploaded file *content* hashes."""
+    # Sort so that uploading [A, B] and [B, A] always map to the same folder.
     key = "_".join(sorted(content_hashes))
+    # Produce a short, filesystem-safe folder name from the combined hashes.
+    # Two different sets of documents → different folder → independent indexes on disk.
     hashed = hashlib.md5(key.encode()).hexdigest()[:10]
     return os.path.join(VECTOR_STORE_DIR, hashed)
 
@@ -37,8 +40,19 @@ def handle_pdf_upload():
     results = []
     if uploaded_files:
         for uploaded_file in uploaded_files:
+            # Read the raw bytes once so we can both hash and save them.
             file_bytes = uploaded_file.getbuffer()
+
+            # Compute an MD5 fingerprint of the file *content* (not the name).
+            # This means the same PDF always gets the same hash regardless of
+            # what it is called, and a different PDF always gets a different hash
+            # even if it shares the same filename.
             content_hash = hashlib.md5(file_bytes).hexdigest()[:12]
+
+            # PyPDFLoader needs a real file path, so write the bytes to a
+            # temporary file on disk. The path is ephemeral (changes each
+            # Streamlit re-run) which is why we use content_hash as the
+            # stable cache key rather than this path.
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
                 temp_file.write(file_bytes)
                 results.append((uploaded_file.name, temp_file.name, content_hash))
@@ -59,6 +73,11 @@ def load_documents(content_hashes_tuple, file_paths_tuple, chunk_size=500, chunk
     Returns:
         list: LangChain Document objects.
     """
+    # @st.cache_resource memoizes this function's return value.
+    # The cache key is (content_hashes_tuple, file_paths_tuple, chunk_size, chunk_overlap).
+    # We pass content_hashes_tuple specifically so the cache is stable: even though
+    # the temp file path changes on every Streamlit re-run, the content hash does not,
+    # so the same PDF is only parsed once for the lifetime of the server process.
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size, chunk_overlap=chunk_overlap
     )
@@ -66,6 +85,8 @@ def load_documents(content_hashes_tuple, file_paths_tuple, chunk_size=500, chunk
     for temp_path in file_paths_tuple:
         loader = PyPDFLoader(temp_path)
         documents = loader.load()
+        # Split each page into smaller, overlapping chunks so the retriever
+        # can pinpoint the most relevant passage rather than a full page.
         splits = text_splitter.split_documents(documents)
         all_splits.extend(splits)
     return all_splits
@@ -85,10 +106,21 @@ def create_vector_store(_documents, store_path, model_name="all-MiniLM-L6-v2"):
         FAISS: Vector store ready for similarity search.
     """
     model = SentenceTransformerEmbeddings(model_name=model_name)
+
+    # Two-level caching strategy:
+    #   Level 1 — @st.cache_resource (in-memory): avoids re-running this function
+    #             at all for the same store_path + model_name within a server session.
+    #   Level 2 — on-disk FAISS index: avoids recomputing embeddings across server
+    #             restarts. store_path is derived from the file *content* hash, so a
+    #             different document always gets a fresh index even with the same filename.
     if os.path.exists(store_path):
+        # Index already computed and saved from a previous run — load it directly.
         return FAISS.load_local(
             store_path, model, allow_dangerous_deserialization=True
         )
+
+    # Index does not exist yet: embed every chunk and persist to disk so future
+    # runs (or server restarts) can skip this expensive step.
     os.makedirs(VECTOR_STORE_DIR, exist_ok=True)
     vector_store = FAISS.from_documents(documents=_documents, embedding=model)
     vector_store.save_local(store_path)
