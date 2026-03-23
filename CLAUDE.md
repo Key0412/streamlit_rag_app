@@ -53,16 +53,17 @@ mcp dev mcp_app/calculator_server.py
 Multiple A2A agents communicating over HTTP. The notebook (`step_by_step_a2a.ipynb`) builds up from a single echo agent to a multi-agent system with an LLM-powered orchestrator.
 
 Agent ports (defined in the notebook):
-- `9001` — Echo Agent
-- `9002` — Math Agent
-- `9003` — Writer Agent
-- `9004` — Orchestrator Agent
+- `10001` — Echo Agent
+- `10002` — Math Agent
+- `10003` — Writer Agent
+- `10004` — Orchestrator Agent
+- `10005` — Stats Agent (Task-path demo)
 
 Agents are written as `.py` files by notebook cells and then launched as subprocesses. If a port is stuck after a kernel interrupt, close the leaked file descriptors from within the kernel:
 
 ```python
 import os
-for fd in [9, 11, 13, 28]:   # FD numbers from: ss -tlnp | grep 900
+for fd in [9, 11, 13, 28]:   # FD numbers from: ss -tlnp | grep 1000
     try: os.close(fd)
     except OSError: pass
 ```
@@ -84,7 +85,7 @@ from a2a.utils import new_agent_text_message
 class MyExecutor(AgentExecutor):
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         text = context.get_user_input()
-        event_queue.enqueue_event(new_agent_text_message("reply"))
+        await event_queue.enqueue_event(new_agent_text_message("reply"))
     async def cancel(self, context, event_queue): pass
 ```
 
